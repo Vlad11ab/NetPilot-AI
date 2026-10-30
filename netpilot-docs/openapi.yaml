@@ -1,0 +1,1356 @@
+openapi: 3.1.0
+info:
+  title: netpilot-api
+  version: 1.0.0
+  description: |
+    NetPilot monitorizează containerele Docker și dispozitivele IoT simulate, deschide incidente pe reguli
+    și lasă un agent AI să propună acțiuni dintr-o listă închisă, pe care un om le aprobă înainte de execuție.
+
+    Contractul acoperă DOAR `netpilot-api` (monolitul, F1–F16). Fiecare microserviciu primește contractul lui
+    când apare în plan: `netpilot-agent` (asistentul `/api/v1/assistant/ask`, F12), `netpilot-remediator` (F14, doar Kafka).
+    **Tot contractul e „Planificat”: nu există cod încă.** Fiecare operație spune în `description` feature-ul
+    din `PLAN.pdf` care o introduce („din F3”). `operationId` = numele metodei de controller care urmează să existe;
+    schemele poartă numele DTO-urilor planificate. Tabelele din spatele lor sunt în `STRUCTURA_BD.pdf`.
+
+    **Convenții**
+    - Căi `/api/v1/<substantiv-la-plural>`. Căile, câmpurile, enum-urile, permisiunile și `operationId` sunt în engleză.
+    - Permisiunea cerută apare în `summary`, între paranteze. Permisiunile rezultă din rol (matricea „Cine ce poate”);
+      cele 13 sunt în schema `Permission`. Fără token: 401. Token valid, permisiune lipsă: 403.
+    - Orele: ISO-8601 fără fus orar, ora serverului (`2026-10-30T10:00:00`). Procente 0–100, latențe în ms, temperaturi în °C, semnal în dBm.
+    - Erorile au forma `ApiErrorResponse {status, error, message, path, timestamp}`, mesajele în engleză.
+    - Validarea eșuată (câmp lipsă, limită depășită, cheie de metrică necunoscută) întoarce **400**; planul nu folosește 422.
+      Excepție: o propunere de remediere respinsă de validator se salvează și întoarce **201** cu `status: REJECTED_BY_VALIDATION`.
+    - Listele (`targets`, `users`, `incidents`, `alert-rules`, `remediations`) se paginează cu `?page=&size=`:
+      `page` de la 0, implicit 0; `size` implicit 20, maxim 100. Răspunsul rămâne un array simplu
+      (lista goală e `[]`), iar numărul total vine în headerul `X-Total-Count`. Planul nu fixează paginarea; aceasta e convenția aleasă.
+    - `GET /targets/{id}/logs` are `last` (1–100) implicit 100: planul dă limita, nu și valoarea implicită.
+
+    **Autentificare**
+    - `bearerAuth`: JWT. Până la F16 îl emite `POST /auth/login` (HS256, valabil 60 de minute, `sub` = email, rolul în claim).
+      Din F16 îl emite Keycloak (realm `netpilot`, client `netpilot-tests` pentru teste, `netpilot-ui` pentru interfață);
+      `/auth/login` și `/users` dispar, `/auth/me` rămâne, citit din token.
+    - `deviceKey`: headerul `X-Device-Key`, doar pe `/api/v1/ingest/**`. Dispozitivul nu are cont; ținta se află din cheie, niciodată din corp.
+    - Din F17, tot traficul trece prin Kong: peste 120 de cereri pe minut per IP răspunsul e 429 (60 pe `/ingest`).
+
+    **Ce nu e în contract**
+    - Serverul MCP (`/mcp`, F8–F9, protocol Streamable HTTP): are tool-uri, nu rute REST (`listOpenIncidents`, `getIncident`, `getTarget`,
+      `getRecentMetrics`, `getRecentLogs`, `findSimilarIncidents`, `getAllowedActions`, `proposeRemediation`); folosesc aceleași service-uri și aceleași permisiuni ca REST.
+    - `/actuator/health` și `/actuator/prometheus` (management pe portul 8081, nepublicat), simulatorul (`/sim/**`, port 8090) și topicurile Kafka (`netpilot-docs/kafka-topics.md`).
+servers:
+  - url: https://{domain}
+    description: EC2, prin nginx cu TLS (și Kong din F17)
+    variables:
+      domain:
+        default: netpilot.domeniul-tau.ro
+  - url: http://localhost:8080
+    description: local, din compose (api, fără nginx)
+security:
+  - bearerAuth: []
+tags:
+  - name: auth
+    description: Login și contul curent
+  - name: users
+    description: Conturile create de administrator (iese în F16, preluat de Keycloak)
+  - name: targets
+    description: Ținte monitorizate, metricile și logurile lor
+  - name: devices
+    description: Dispozitive IoT simulate și cheia lor
+  - name: ingest
+    description: Telemetria trimisă de dispozitive, cu cheie API
+  - name: incidents
+    description: Incidente deschise de reguli, timeline-ul lor
+  - name: alert-rules
+    description: Reguli de prag și de lipsă de date
+  - name: remediations
+    description: Acțiuni propuse, validate, aprobate de un om și verificate
+
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Întoarce tokenul JWT
+      description: |
+        Planificat — din F2. Iese în F16 (tokenul vine de la Keycloak); după aceea răspunde 401 fără token, 404 cu token.
+        Login greșit, email inexistent sau cont dezactivat: 401, același mesaj. Parola nu apare în răspuns și nici în log.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Autentificat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Contul din token, cu rolul și permisiunile lui
+      description: |
+        Planificat — din F2. Rămâne și după F16, citit din token. Interfața îl folosește ca să arate butoanele de scriere (U1);
+        asistentul îl folosea ca să verifice tokenul omului, până în F16.
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/users:
+    get:
+      tags: [users]
+      summary: Lista conturilor (USER_MANAGE)
+      description: Planificat — din F2. Iese în F16.
+      operationId: listUsers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/XTotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [users]
+      summary: Administratorul creează un cont VIEWER, OPERATOR sau AGENT (USER_MANAGE)
+      description: |
+        Planificat — din F2 (contul AGENT se creează aici în F9). Iese în F16. Fără înregistrare publică.
+        Adminul inițial nu vine din API, ci din `AdminSeeder` (`ADMIN_EMAIL` / `ADMIN_PASSWORD`).
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserRequest' }
+      responses:
+        '201':
+          description: Cont creat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    patch:
+      tags: [users]
+      summary: Schimbă rolul sau `enabled` (USER_MANAGE)
+      description: |
+        Planificat — din F2. Iese în F16.
+        Ultimul ADMIN activ nu poate fi retrogradat sau dezactivat: 409.
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserPatch' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [users]
+      summary: Dezactivează contul (USER_MANAGE)
+      description: |
+        Planificat — din F2. Iese în F16. DELETE = dezactivare (`enabled=false`), rândul rămâne.
+        Ultimul ADMIN activ nu poate fi dezactivat: 409.
+      operationId: disableUser
+      responses:
+        '204':
+          description: Dezactivat
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/targets:
+    get:
+      tags: [targets]
+      summary: Lista țintelor (TARGET_VIEW)
+      description: |
+        Planificat — din F1 (deschis, fără cont); din F2 cere `TARGET_VIEW`. Lista goală e `[]`.
+        Un dispozitiv apare cu obiectul `device` completat, fără cheie.
+      operationId: listTargets
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/XTotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TargetResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [targets]
+      summary: Înregistrează o țintă de tip CONTAINER (TARGET_MANAGE)
+      description: |
+        Planificat — din F1 (deschis); din F2 cere `TARGET_MANAGE`.
+        `type: DEVICE` aici întoarce 400: dispozitivele se creează prin `POST /devices`, cu cheia lor (F5).
+        Slug duplicat: 409.
+      operationId: createTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TargetRequest' }
+      responses:
+        '201':
+          description: Creată
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TargetResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/targets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [targets]
+      summary: O țintă (TARGET_VIEW)
+      description: Planificat — din F1 (deschis); din F2 cere `TARGET_VIEW`.
+      operationId: getTarget
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TargetResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [targets]
+      summary: Schimbă doar câmpurile trimise (TARGET_MANAGE)
+      description: |
+        Planificat — din F2. Aceeași operație setează `containerLabel` (F3), `healthUrl` (F4) și `remediationEnabled` (F7).
+        `healthUrl` doar `http://` / `https://` și doar pe CONTAINER (400). `slug` și `type` nu se schimbă.
+        Eticheta `containerLabel` duplicată: 409.
+      operationId: updateTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TargetPatch' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TargetResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [targets]
+      summary: Șterge o țintă fără istoric (TARGET_MANAGE)
+      description: |
+        Planificat — din F2. Cu eșantioane, loguri sau incidente (din F3) ștergerea e refuzată cu 409:
+        cheile străine sunt pe `RESTRICT`.
+      operationId: deleteTarget
+      responses:
+        '204':
+          description: Ștearsă
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/targets/{id}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [targets]
+      summary: Metricile recente ale țintei (METRIC_VIEW)
+      description: |
+        Planificat — din F3 (cheile `health_up` și `http_latency_ms` din F4, cele de dispozitiv din F5).
+        Până la 60 de minute: eșantioane brute. Între 61 și 1440: media pe găleți de 5 minute
+        (`minutes=1440` dă cel mult 289 de puncte). Cele mai vechi primele.
+        Cheia necunoscută pentru tipul țintei sau `minutes` în afara 1–1440: 400.
+      operationId: getTargetMetrics
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: |
+            Container: `cpu_percent`, `mem_percent`, `restart_count`, `running`, `health_up`, `http_latency_ms`.
+            Dispozitiv: `temperature_c`, `battery_percent`, `rssi_dbm`.
+          schema: { $ref: '#/components/schemas/MetricKey' }
+        - name: minutes
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 1440, example: 10 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MetricSample' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/targets/{id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [targets]
+      summary: Liniile importante din logul țintei (LOG_VIEW)
+      description: |
+        Planificat — din F4. Doar WARN și ERROR, mascate la colectare (`password=`, `secret`, `Bearer` devin `***`).
+        `level=WARN` întoarce WARN și ERROR. Cele mai noi primele. VIEWER primește 403.
+      operationId: getTargetLogs
+      parameters:
+        - name: level
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/LogLevel' }
+        - name: last
+          in: query
+          required: false
+          description: Câte linii; implicit 100.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/LogEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices:
+    post:
+      tags: [devices]
+      summary: Creează un dispozitiv și îi arată cheia o singură dată (DEVICE_MANAGE)
+      description: |
+        Planificat — din F5. În aceeași tranzacție se creează ținta de tip DEVICE și dispozitivul. În bază rămâne doar SHA-256 al cheii.
+        Dispozitivele se citesc apoi prin `GET /targets`, fără cheie.
+      operationId: createDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceRequest' }
+      responses:
+        '201':
+          description: Creat; `apiKey` apare doar aici
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/devices/{id}/rotate-key:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Id-ul dispozitivului (`device.id`), nu al țintei.
+        schema: { type: integer, format: int64 }
+    post:
+      tags: [devices]
+      summary: Rotește cheia dispozitivului (DEVICE_MANAGE)
+      description: |
+        Planificat — din F5. Cheia veche se invalidează pe loc: dispozitivul primește 401 la următorul POST și, fără eșantioane, trece DOWN.
+        Cheia nouă apare o singură dată, în acest răspuns.
+      operationId: rotateDeviceKey
+      responses:
+        '200':
+          description: Cheie nouă
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/ingest/telemetry:
+    post:
+      tags: [ingest]
+      summary: Dispozitivul trimite eșantioane și primește comenzile PENDING
+      description: |
+        Planificat — din F5 (comenzile din F7). Se autentifică cu `X-Device-Key`; un JWT aici dă 401, iar o cheie de dispozitiv pe alte rute dă 401.
+        Ținta se ia din cheie, niciodată din corp; `sampledAt` = ora serverului.
+        Un POST fără eșantioane e valid (200) și doar actualizează `last_seen_at`; un POST cu eșantioane trece ținta în UP.
+
+        Piggyback (din F7): răspunsul conține comenzile `PENDING` ale dispozitivului, care devin `DELIVERED`.
+        În POST-ul următor dispozitivul le confirmă în `ack` (ids), iar comenzile devin `ACKED` și acțiunea `SUCCEEDED`;
+        fără confirmare în 60 s acțiunea e `FAILED`.
+      operationId: ingestTelemetry
+      security:
+        - deviceKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TelemetryRequest' }
+      responses:
+        '200':
+          description: Primit; `commands` e lista comenzilor de executat (poate fi goală)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TelemetryResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/incidents:
+    get:
+      tags: [incidents]
+      summary: Incidentele, opțional după status (INCIDENT_VIEW)
+      description: Planificat — din F6. Cele mai noi primele.
+      operationId: listIncidents
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/IncidentStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/XTotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IncidentResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/incidents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [incidents]
+      summary: Un incident (INCIDENT_VIEW)
+      description: Planificat — din F6.
+      operationId: getIncident
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/incidents/{id}/acknowledge:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [incidents]
+      summary: Confirmă incidentul (INCIDENT_MANAGE)
+      description: |
+        Planificat — din F6. `OPEN` → `ACKNOWLEDGED`, eveniment `ACKNOWLEDGED` cu emailul din token.
+        Pe un incident `ACKNOWLEDGED` sau `RESOLVED`: 409. VIEWER primește 403.
+      operationId: acknowledgeIncident
+      responses:
+        '200':
+          description: Confirmat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/incidents/{id}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [incidents]
+      summary: Închide incidentul de mână (INCIDENT_MANAGE)
+      description: |
+        Planificat — din F6. Rezultă `resolution: MANUAL`, eveniment `RESOLVED`. Pe un incident `RESOLVED`: 409.
+        Incidentele se rezolvă și singure (`AUTO`) când condiția dispare.
+      operationId: resolveIncident
+      responses:
+        '200':
+          description: Rezolvat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/incidents/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [incidents]
+      summary: Timeline-ul incidentului, adică auditul (AUDIT_VIEW)
+      description: |
+        Planificat — din F7 (evenimentele se scriu din F6; `AGENT_STARTED` apare din F9). Cele mai vechi primele.
+        Evenimentele nu se modifică și nu se șterg. VIEWER primește 403.
+      operationId: getIncidentEvents
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IncidentEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/alert-rules:
+    get:
+      tags: [alert-rules]
+      summary: Regulile de alertă (INCIDENT_VIEW)
+      description: Planificat — din F6. Include cele 6 reguli implicite din migrarea `V6`.
+      operationId: listAlertRules
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/XTotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [alert-rules]
+      summary: Creează o regulă (ALERT_RULE_MANAGE)
+      description: |
+        Planificat — din F6. `consecutiveSamples` între 1 și 20 (400). Regula specială `metricKey: NO_DATA` nu are `operator` și `threshold`, ci `forSeconds`.
+        `targetId` lipsă = regula se aplică tuturor țintelor tipului.
+      operationId: createAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertRuleRequest' }
+      responses:
+        '201':
+          description: Creată
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/alert-rules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    put:
+      tags: [alert-rules]
+      summary: Schimbă pragul, numărul de eșantioane sau `enabled` (ALERT_RULE_MANAGE)
+      description: |
+        Planificat — din F6. Tipul țintei, `targetId`, `metricKey`, `operator` și `severity` nu se schimbă.
+        `consecutiveSamples` între 1 și 20 (400).
+      operationId: updateAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertRuleUpdate' }
+      responses:
+        '200':
+          description: Salvată
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/remediations:
+    get:
+      tags: [remediations]
+      summary: Acțiunile de remediere, opțional după status (INCIDENT_VIEW)
+      description: Planificat — din F7. Cele mai noi primele.
+      operationId: listRemediations
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/RemediationStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/XTotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RemediationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [remediations]
+      summary: Propune o acțiune pe un incident (REMEDIATION_PROPOSE)
+      description: |
+        Planificat — din F7. Se salvează mereu, cu `source: HUMAN`. Validatorul rulează la propunere:
+        valid → `PROPOSED` cu `expiresAt` = +15 minute; invalid → **201** cu `REJECTED_BY_VALIDATION` și `rejectionReason`, nu 400.
+        `target_id` se scrie mereu ca ținta incidentului; `targetId` din cerere se păstrează doar ca `requestedTargetId`
+        și, dacă diferă (chiar inexistent), propunerea iese `TARGET_MISMATCH`.
+        Un singur `PROPOSED` deschis per incident: a doua propunere dă 409. Contul AGENT propune prin tool-ul MCP `proposeRemediation` (F9), același service.
+      operationId: proposeRemediation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemediationRequest' }
+      responses:
+        '201':
+          description: Salvată, validă (`PROPOSED`) sau respinsă de validator (`REJECTED_BY_VALIDATION`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/remediations/dry-run:
+    post:
+      tags: [remediations]
+      summary: Verifică o propunere fără să salveze nimic (REMEDIATION_PROPOSE)
+      description: |
+        Planificat — din F7. Aceeași validare ca la propunere, dar fără niciun rând, niciun eveniment și niciun apel spre Docker.
+      operationId: dryRunRemediation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemediationRequest' }
+      responses:
+        '200':
+          description: Rezultatul validatorului
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DryRunResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/remediations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [remediations]
+      summary: O acțiune de remediere (INCIDENT_VIEW)
+      description: Planificat — din F7.
+      operationId: getRemediation
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/remediations/{id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [remediations]
+      summary: Aprobă propunerea; un om, nu agentul (REMEDIATION_APPROVE)
+      description: |
+        Planificat — din F7; `202` din F13. `PROPOSED` → `APPROVED`, apoi execuția revalidează și trece `APPROVED` → `EXECUTING`
+        printr-un UPDATE condiționat pe status: două aprobări simultane dau exact un succes și un 409.
+        Din F7: **200** cu `EXECUTING`; rezultatul (`SUCCEEDED` / `FAILED`) se vede la ciclul următor, prin `GET /remediations/{id}`.
+        Din F13: pentru `RESTART_CONTAINER` răspunsul e **202** (cererea pleacă pe Kafka, restartul nu mai ține cererea HTTP deschisă);
+        comenzile de dispozitiv și `NO_ACTION` păstrează 200.
+        Contul AGENT primește 403: n-are `REMEDIATION_APPROVE`. Pe o acțiune care nu e `PROPOSED` (și pe una expirată): 409.
+      operationId: approveRemediation
+      responses:
+        '200':
+          description: Aprobată; `EXECUTING`, sau `SUCCEEDED` pe loc la `NO_ACTION`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationResponse' }
+        '202':
+          description: Din F13, `RESTART_CONTAINER` aprobat și trimis spre executor; rămâne `APPROVED` până răspunde remediatorul
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/remediations/{id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [remediations]
+      summary: Respinge propunerea (REMEDIATION_APPROVE)
+      description: |
+        Planificat — din F7. `PROPOSED` → `REJECTED`, eveniment `REJECTED` cu emailul din token.
+        Pe o acțiune care nu e `PROPOSED`: 409.
+      operationId: rejectRemediation
+      responses:
+        '200':
+          description: Respinsă
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Tokenul din `POST /auth/login` (HS256, 60 de minute) până la F16; din F16, tokenul Keycloak (realm `netpilot`).
+        Permisiunile sunt cele 13 din enum-ul `Permission`, în claim-ul rolului.
+    deviceKey:
+      type: apiKey
+      in: header
+      name: X-Device-Key
+      description: Cheia dispozitivului, arătată o singură dată la creare sau rotire. Doar pe `/api/v1/ingest/**`.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Pagina, de la 0.
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      name: size
+      in: query
+      required: false
+      description: Câte elemente pe pagină.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  headers:
+    XTotalCount:
+      description: Numărul total de elemente, înainte de paginare.
+      schema: { type: integer, format: int64 }
+
+  responses:
+    BadRequest:
+      description: Date invalide
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+          example:
+            timestamp: '2026-10-30T10:00:00'
+            status: 400
+            error: BAD_REQUEST
+            message: 'slug: must match [a-z0-9-]{3,50}'
+            path: /api/v1/targets
+    Unauthorized:
+      description: Lipsește tokenul sau cheia, sunt invalide sau expirate, ori loginul e greșit
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+          example:
+            timestamp: '2026-10-30T10:00:00'
+            status: 401
+            error: UNAUTHORIZED
+            message: Authentication is required to access this resource
+            path: /api/v1/targets
+    Forbidden:
+      description: Tokenul e valid, dar permisiunea lipsește
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+          example:
+            timestamp: '2026-10-30T10:00:00'
+            status: 403
+            error: FORBIDDEN
+            message: You do not have permission to perform this action
+            path: /api/v1/targets
+    NotFound:
+      description: Nu există
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+          example:
+            timestamp: '2026-10-30T10:00:00'
+            status: 404
+            error: NOT_FOUND
+            message: Target not found
+            path: /api/v1/targets/999
+    Conflict:
+      description: Încalcă o regulă (unicitate, istoric, status)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+          example:
+            timestamp: '2026-10-30T10:00:00'
+            status: 409
+            error: CONFLICT
+            message: Target slug already exists
+            path: /api/v1/targets
+
+  schemas:
+    ApiErrorResponse:
+      type: object
+      description: Forma tuturor erorilor, inclusiv 401 și 403 din filtrele de securitate.
+      required: [timestamp, status, error, message, path]
+      properties:
+        timestamp: { type: string, example: '2026-10-30T10:00:00' }
+        status: { type: integer, example: 404 }
+        error: { type: string, example: NOT_FOUND }
+        message: { type: string, example: Target not found }
+        path: { type: string, example: /api/v1/targets/999 }
+
+    Role:
+      type: string
+      description: |
+        Permisiunile rezultă din rol, dintr-o singură hartă în cod (`RolePermissions`): VIEWER 4, OPERATOR 9, ADMIN 13, AGENT 5.
+      enum: [VIEWER, OPERATOR, ADMIN, AGENT]
+
+    Permission:
+      type: string
+      description: |
+        Toate cele 13, definite din F2. VIEWER: TARGET_VIEW, METRIC_VIEW, INCIDENT_VIEW, ASSISTANT_USE.
+        OPERATOR: VIEWER + LOG_VIEW, INCIDENT_MANAGE, REMEDIATION_PROPOSE, REMEDIATION_APPROVE, AUDIT_VIEW. ADMIN: toate.
+        AGENT: TARGET_VIEW, METRIC_VIEW, LOG_VIEW, INCIDENT_VIEW, REMEDIATION_PROPOSE (nu are REMEDIATION_APPROVE și nici ASSISTANT_USE).
+      enum:
+        - TARGET_VIEW
+        - TARGET_MANAGE
+        - METRIC_VIEW
+        - LOG_VIEW
+        - DEVICE_MANAGE
+        - ALERT_RULE_MANAGE
+        - INCIDENT_VIEW
+        - INCIDENT_MANAGE
+        - REMEDIATION_PROPOSE
+        - REMEDIATION_APPROVE
+        - AUDIT_VIEW
+        - ASSISTANT_USE
+        - USER_MANAGE
+
+    TargetType:
+      type: string
+      enum: [CONTAINER, DEVICE]
+
+    TargetStatus:
+      type: string
+      description: |
+        `UNKNOWN` la creare și când containerul nu e găsit; `DOWN` la `running = 0` sau dispozitiv fără eșantioane în 3 × `samplingSeconds`;
+        `DEGRADED` când rulează, dar `health_up = 0`.
+      enum: [UP, DEGRADED, DOWN, UNKNOWN]
+
+    MetricKey:
+      type: string
+      description: Setul permis depinde de tipul țintei; o cheie necunoscută dă 400.
+      enum:
+        - cpu_percent
+        - mem_percent
+        - restart_count
+        - running
+        - health_up
+        - http_latency_ms
+        - temperature_c
+        - battery_percent
+        - rssi_dbm
+
+    DeviceMetricKey:
+      type: string
+      enum: [temperature_c, battery_percent, rssi_dbm]
+
+    LogLevel:
+      type: string
+      enum: [WARN, ERROR]
+
+    IncidentStatus:
+      type: string
+      description: '`RESOLVED` e final. „Investigat” nu e stare, ci evenimentul `AGENT_STARTED`.'
+      enum: [OPEN, ACKNOWLEDGED, RESOLVED]
+
+    Severity:
+      type: string
+      enum: [WARNING, CRITICAL]
+
+    Resolution:
+      type: string
+      enum: [AUTO, MANUAL]
+
+    IncidentEventType:
+      type: string
+      enum: [OPENED, ACKNOWLEDGED, AGENT_STARTED, PROPOSED, APPROVED, REJECTED, EXECUTED, FAILED, RESOLVED, NOTE]
+
+    RuleOperator:
+      type: string
+      enum: [GT, LT, EQ]
+
+    ActionType:
+      type: string
+      description: Lista închisă. `NO_ACTION` e mereu permisă și înseamnă „diagnostic, fără efect”.
+      enum: [RESTART_CONTAINER, REBOOT_DEVICE, SET_SAMPLING_INTERVAL, NO_ACTION]
+
+    ActionSource:
+      type: string
+      enum: [HUMAN, AGENT_RULES, AGENT_LLM]
+
+    RemediationStatus:
+      type: string
+      description: |
+        `PROPOSED` → `APPROVED` → `EXECUTING` → `SUCCEEDED` / `FAILED`; `REJECTED_BY_VALIDATION` la propunere invalidă,
+        `REJECTED` când un om respinge, `EXPIRED` după 15 minute (sau după `validUntil`, din F14).
+      enum: [PROPOSED, REJECTED_BY_VALIDATION, APPROVED, REJECTED, EXPIRED, EXECUTING, SUCCEEDED, FAILED]
+
+    RejectionReason:
+      type: string
+      enum:
+        - TARGET_MISMATCH
+        - ACTION_NOT_ALLOWED
+        - REMEDIATION_DISABLED
+        - INVALID_PARAMS
+        - COOLDOWN_ACTIVE
+        - TARGET_NOT_LABELED
+        - INCIDENT_RESOLVED
+
+    DeviceCommandName:
+      type: string
+      enum: [REBOOT_DEVICE, SET_SAMPLING_INTERVAL]
+
+    DeviceCommandStatus:
+      type: string
+      enum: [PENDING, DELIVERED, ACKED]
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 255, example: admin@netpilot.ro }
+        password: { type: string, minLength: 1, example: parola-din-env }
+
+    LoginResponse:
+      type: object
+      required: [token, expiresInSeconds]
+      properties:
+        token: { type: string, example: eyJhbGciOiJIUzI1NiJ9... }
+        expiresInSeconds: { type: integer, example: 3600 }
+
+    MeResponse:
+      type: object
+      required: [email, role, permissions]
+      properties:
+        email: { type: string, example: admin@netpilot.ro }
+        role: { $ref: '#/components/schemas/Role' }
+        permissions:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Permission' }
+
+    UserRequest:
+      type: object
+      required: [email, password, role]
+      properties:
+        email: { type: string, format: email, maxLength: 255, example: operator@netpilot.ro }
+        password: { type: string, minLength: 8, maxLength: 72, example: parola-lunga-1 }
+        role: { $ref: '#/components/schemas/Role' }
+
+    UserPatch:
+      type: object
+      description: Cel puțin un câmp.
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+        enabled: { type: boolean }
+
+    UserResponse:
+      type: object
+      required: [id, email, role, enabled, createdAt]
+      properties:
+        id: { type: integer, format: int64, example: 2 }
+        email: { type: string, example: operator@netpilot.ro }
+        role: { $ref: '#/components/schemas/Role' }
+        enabled: { type: boolean, example: true }
+        createdAt: { type: string, example: '2026-10-30T10:00:00' }
+
+    TargetRequest:
+      type: object
+      required: [slug, name, type]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9-]{3,50}$'
+          example: user-management
+        name: { type: string, minLength: 1, maxLength: 100, example: User management }
+        type:
+          $ref: '#/components/schemas/TargetType'
+          description: Pe acest endpoint doar `CONTAINER`; `DEVICE` dă 400.
+
+    TargetPatch:
+      type: object
+      description: Doar câmpurile trimise se schimbă.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        containerLabel:
+          type: string
+          maxLength: 50
+          description: Valoarea etichetei `netpilot.target` a containerului; doar la CONTAINER, unică. Din F3.
+          example: user-management
+        healthUrl:
+          type: string
+          maxLength: 255
+          format: uri
+          description: Doar `http://` / `https://`, doar la CONTAINER. Din F4.
+          example: http://user-management:8080/api/users
+        remediationEnabled:
+          type: boolean
+          description: Implicit false. Din F7.
+
+    DeviceInfo:
+      type: object
+      description: Detaliile dispozitivului dintr-o țintă DEVICE. Cheia nu apare niciodată aici.
+      required: [id, deviceType, samplingSeconds]
+      properties:
+        id: { type: integer, format: int64, example: 3 }
+        deviceType: { type: string, example: temperature-sensor }
+        firmware: { type: [string, 'null'], example: 1.0.2 }
+        samplingSeconds: { type: integer, minimum: 5, maximum: 300, example: 10 }
+
+    TargetResponse:
+      type: object
+      required: [id, slug, name, type, createdAt, status, remediationEnabled]
+      properties:
+        id: { type: integer, format: int64, example: 1 }
+        slug: { type: string, example: user-management }
+        name: { type: string, example: User management }
+        type: { $ref: '#/components/schemas/TargetType' }
+        createdAt: { type: string, example: '2026-10-30T10:00:00' }
+        containerLabel: { type: [string, 'null'], example: user-management, description: 'Din F3.' }
+        status: { $ref: '#/components/schemas/TargetStatus' }
+        lastSeenAt: { type: [string, 'null'], example: '2026-10-30T10:05:30', description: 'Ultima citire a colectorului sau ultimul POST al dispozitivului. Din F3.' }
+        healthUrl: { type: [string, 'null'], example: 'http://user-management:8080/api/users', description: 'Din F4.' }
+        remediationEnabled: { type: boolean, example: false, description: 'Din F7.' }
+        device:
+          oneOf:
+            - $ref: '#/components/schemas/DeviceInfo'
+            - type: 'null'
+          description: 'Completat doar la `type: DEVICE` (F5).'
+
+    MetricSample:
+      type: object
+      description: |
+        Un punct al ferestrei cerute. La `minutes` ≤ 60 e eșantionul brut; la 61–1440, media unei găleți de 5 minute
+        (`sampledAt` = începutul găleții).
+      required: [sampledAt, value]
+      properties:
+        sampledAt: { type: string, example: '2026-10-30T10:05:00' }
+        value: { type: number, format: double, example: 20.0 }
+
+    LogEntry:
+      type: object
+      required: [id, loggedAt, level, message]
+      properties:
+        id: { type: integer, format: int64, example: 41 }
+        loggedAt: { type: string, example: '2026-10-30T10:04:12.345678' }
+        level: { $ref: '#/components/schemas/LogLevel' }
+        message:
+          type: string
+          maxLength: 1000
+          description: Mascat la colectare, tăiat la 1000 de caractere.
+          example: 'ERROR db login password=***'
+
+    DeviceRequest:
+      type: object
+      required: [slug, name, deviceType]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9-]{3,50}$'
+          example: sensor-01
+        name: { type: string, minLength: 1, maxLength: 100, example: Senzor 01 }
+        deviceType: { type: string, maxLength: 30, example: temperature-sensor }
+        firmware: { type: string, maxLength: 30, example: 1.0.2 }
+        samplingSeconds: { type: integer, minimum: 5, maximum: 300, default: 10 }
+
+    DeviceKeyResponse:
+      type: object
+      required: [target, apiKey]
+      properties:
+        target: { $ref: '#/components/schemas/TargetResponse' }
+        apiKey:
+          type: string
+          description: 32 de octeți aleatori, Base64URL. Se arată o singură dată; în bază rămâne doar SHA-256.
+          example: q3x9T0mC1uYV5dJc8e0nZr2mH7pKfQwA1sLbNvXyZ4U
+
+    TelemetrySample:
+      type: object
+      required: [key, value]
+      properties:
+        key: { $ref: '#/components/schemas/DeviceMetricKey' }
+        value: { type: number, format: double, example: 24.5 }
+
+    TelemetryRequest:
+      type: object
+      properties:
+        samples:
+          type: array
+          description: Poate lipsi sau fi goală (200, doar `last_seen_at`). O cheie în afara celor trei dă 400.
+          items: { $ref: '#/components/schemas/TelemetrySample' }
+        ack:
+          type: array
+          description: Id-urile comenzilor primite în răspunsul anterior și executate. Din F7.
+          items: { type: integer, format: int64 }
+          example: [12]
+
+    DeviceCommand:
+      type: object
+      description: Comanda de executat, livrată în răspunsul la telemetrie. Din F7.
+      required: [id, command, status]
+      properties:
+        id: { type: integer, format: int64, example: 12 }
+        command: { $ref: '#/components/schemas/DeviceCommandName' }
+        params:
+          type: [object, 'null']
+          description: 'La `SET_SAMPLING_INTERVAL`, `{"seconds": 5–300}`.'
+          properties:
+            seconds: { type: integer, minimum: 5, maximum: 300 }
+          example: { seconds: 30 }
+        status: { $ref: '#/components/schemas/DeviceCommandStatus' }
+
+    TelemetryResponse:
+      type: object
+      required: [commands]
+      properties:
+        commands:
+          type: array
+          description: Comenzile `PENDING` ale dispozitivului; în răspuns devin `DELIVERED`.
+          items: { $ref: '#/components/schemas/DeviceCommand' }
+
+    IncidentResponse:
+      type: object
+      required: [id, targetId, ruleId, severity, status, title, openedAt]
+      properties:
+        id: { type: integer, format: int64, example: 5 }
+        targetId: { type: integer, format: int64, example: 1 }
+        ruleId: { type: integer, format: int64, example: 1 }
+        severity: { $ref: '#/components/schemas/Severity' }
+        status: { $ref: '#/components/schemas/IncidentStatus' }
+        title: { type: string, example: 'user-management: running = 0' }
+        openedAt: { type: string, example: '2026-10-30T10:06:00' }
+        acknowledgedBy: { type: [string, 'null'], example: operator@netpilot.ro }
+        acknowledgedAt: { type: [string, 'null'], example: '2026-10-30T10:07:00' }
+        resolvedBy: { type: [string, 'null'], description: 'Emailul omului sau `system`.', example: system }
+        resolvedAt: { type: [string, 'null'], example: '2026-10-30T10:09:00' }
+        resolution:
+          oneOf:
+            - $ref: '#/components/schemas/Resolution'
+            - type: 'null'
+
+    IncidentEvent:
+      type: object
+      required: [id, incidentId, at, actor, type]
+      properties:
+        id: { type: integer, format: int64, example: 31 }
+        incidentId: { type: integer, format: int64, example: 5 }
+        at: { type: string, example: '2026-10-30T10:06:00' }
+        actor: { type: string, description: 'Emailul sau `system`.', example: system }
+        type: { $ref: '#/components/schemas/IncidentEventType' }
+        details: { type: [string, 'null'], maxLength: 1000, example: 'rule 1 violated on 2 consecutive samples' }
+
+    AlertRuleRequest:
+      type: object
+      required: [targetType, metricKey, consecutiveSamples, severity, enabled]
+      properties:
+        targetType: { $ref: '#/components/schemas/TargetType' }
+        targetId:
+          type: [integer, 'null']
+          format: int64
+          description: Lipsă sau null = toate țintele tipului.
+        metricKey:
+          type: string
+          maxLength: 30
+          description: O cheie de metrică a tipului țintei, sau `NO_DATA` la regula de lipsă de date.
+          example: mem_percent
+        operator:
+          oneOf:
+            - $ref: '#/components/schemas/RuleOperator'
+            - type: 'null'
+          description: Obligatoriu cu `threshold`; null la `NO_DATA`.
+        threshold: { type: [number, 'null'], format: double, example: 90 }
+        consecutiveSamples: { type: integer, minimum: 1, maximum: 20, example: 10 }
+        forSeconds:
+          type: [integer, 'null']
+          description: Doar la `NO_DATA`.
+          example: 60
+        severity: { $ref: '#/components/schemas/Severity' }
+        enabled: { type: boolean, example: true }
+
+    AlertRuleUpdate:
+      type: object
+      required: [threshold, consecutiveSamples, enabled]
+      properties:
+        threshold: { type: [number, 'null'], format: double, example: 85 }
+        consecutiveSamples: { type: integer, minimum: 1, maximum: 20, example: 6 }
+        forSeconds: { type: [integer, 'null'], description: 'Doar la `NO_DATA`.', example: 90 }
+        enabled: { type: boolean, example: true }
+
+    AlertRuleResponse:
+      type: object
+      required: [id, targetType, metricKey, consecutiveSamples, severity, enabled]
+      properties:
+        id: { type: integer, format: int64, example: 3 }
+        targetType: { $ref: '#/components/schemas/TargetType' }
+        targetId: { type: [integer, 'null'], format: int64 }
+        metricKey: { type: string, example: mem_percent }
+        operator:
+          oneOf:
+            - $ref: '#/components/schemas/RuleOperator'
+            - type: 'null'
+        threshold: { type: [number, 'null'], format: double, example: 90 }
+        consecutiveSamples: { type: integer, example: 10 }
+        forSeconds: { type: [integer, 'null'], example: null }
+        severity: { $ref: '#/components/schemas/Severity' }
+        enabled: { type: boolean, example: true }
+
+    RemediationRequest:
+      type: object
+      required: [incidentId, actionType]
+      properties:
+        incidentId: { type: integer, format: int64, example: 5 }
+        actionType: { $ref: '#/components/schemas/ActionType' }
+        params:
+          type: [object, 'null']
+          description: 'Doar la `SET_SAMPLING_INTERVAL`, `{"seconds": 5–300}`; la celelalte lipsește.'
+          properties:
+            seconds: { type: integer, minimum: 5, maximum: 300 }
+          example: { seconds: 30 }
+        targetId:
+          type: [integer, 'null']
+          format: int64
+          description: Ținta pe care vrea propunătorul acțiunea. Ținta reală e mereu cea a incidentului; dacă diferă, `TARGET_MISMATCH`.
+        probableCause: { type: string, maxLength: 500, example: 'supraîncălzire, de verificat ventilația' }
+        confidence: { type: number, format: double, minimum: 0, maximum: 1, example: 0.8 }
+        evidence: { type: string, maxLength: 2000 }
+
+    DryRunResponse:
+      type: object
+      required: [valid]
+      properties:
+        valid: { type: boolean, example: false }
+        rejectionReason:
+          oneOf:
+            - $ref: '#/components/schemas/RejectionReason'
+            - type: 'null'
+
+    RemediationResponse:
+      type: object
+      required: [id, incidentId, targetId, actionType, proposedBy, source, valid, status, expiresAt, createdAt]
+      properties:
+        id: { type: integer, format: int64, example: 8 }
+        incidentId: { type: integer, format: int64, example: 5 }
+        targetId: { type: integer, format: int64, description: 'Mereu ținta incidentului.', example: 1 }
+        requestedTargetId:
+          type: [integer, 'null']
+          format: int64
+          description: Ținta cerută de propunător, dacă a dat una (fără cheie străină, poate fi inexistentă).
+        actionType: { $ref: '#/components/schemas/ActionType' }
+        params:
+          type: [object, 'null']
+          properties:
+            seconds: { type: integer, minimum: 5, maximum: 300 }
+        proposedBy: { type: string, example: operator@netpilot.ro }
+        source: { $ref: '#/components/schemas/ActionSource' }
+        probableCause: { type: [string, 'null'], example: 'container oprit, restart_count stabil' }
+        confidence: { type: [number, 'null'], format: double, example: 0.8 }
+        evidence: { type: [string, 'null'] }
+        valid: { type: boolean, description: 'Rezultatul validatorului la propunere.', example: true }
+        rejectionReason:
+          oneOf:
+            - $ref: '#/components/schemas/RejectionReason'
+            - type: 'null'
+        status: { $ref: '#/components/schemas/RemediationStatus' }
+        decidedBy: { type: [string, 'null'], example: operator@netpilot.ro }
+        decidedAt: { type: [string, 'null'], example: '2026-10-30T10:08:00' }
+        executedAt: { type: [string, 'null'], example: '2026-10-30T10:08:05' }
+        resultMessage: { type: [string, 'null'], maxLength: 500 }
+        expiresAt: { type: string, description: 'Propunerea + 15 minute.', example: '2026-10-30T10:22:00' }
+        createdAt: { type: string, example: '2026-10-30T10:07:00' }
+
+
+    AnswerSource:
+      type: object
+      required: [tool]
+      properties:
+        tool: { type: string, example: listOpenIncidents }
+        arguments:
+          type: object
+          additionalProperties: true
+          example: {}
+

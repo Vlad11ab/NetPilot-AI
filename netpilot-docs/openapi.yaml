@@ -3,8 +3,10 @@ info:
   title: netpilot-api
   version: 1.0.0
   description: |
-    NetPilot monitorizează containerele Docker și dispozitivele IoT simulate, deschide incidente pe reguli
+    NetPilot monitorizează containerele Docker, un Raspberry Pi real și dispozitivele IoT simulate, deschide incidente pe reguli
     și lasă un agent AI să propună acțiuni dintr-o listă închisă, pe care un om le aprobă înainte de execuție.
+    Din F13b, doar acțiunile marcate `auto` de administrator le aprobă sistemul, cu modul autonom pornit și în bugetul per țintă;
+    peste buget sau cu verificarea picată, propunerea iese `ESCALATED` și așteaptă un om.
 
     Contractul acoperă DOAR `netpilot-api` (monolitul, F1–F16). Fiecare microserviciu primește contractul lui
     când apare în plan: `netpilot-agent` (asistentul `/api/v1/assistant/ask`, F12), `netpilot-remediator` (F14, doar Kafka).
@@ -15,7 +17,7 @@ info:
     **Convenții**
     - Căi `/api/v1/<substantiv-la-plural>`. Căile, câmpurile, enum-urile, permisiunile și `operationId` sunt în engleză.
     - Permisiunea cerută apare în `summary`, între paranteze. Permisiunile rezultă din rol (matricea „Cine ce poate”);
-      cele 13 sunt în schema `Permission`. Fără token: 401. Token valid, permisiune lipsă: 403.
+      cele 14 sunt în schema `Permission`. Fără token: 401. Token valid, permisiune lipsă: 403.
     - Orele: ISO-8601 fără fus orar, ora serverului (`2026-10-30T10:00:00`). Procente 0–100, latențe în ms, temperaturi în °C, semnal în dBm.
     - Erorile au forma `ApiErrorResponse {status, error, message, path, timestamp}`, mesajele în engleză.
     - Validarea eșuată (câmp lipsă, limită depășită, cheie de metrică necunoscută) întoarce **400**; planul nu folosește 422.
@@ -36,6 +38,7 @@ info:
     - Serverul MCP (`/mcp`, F8–F9, protocol Streamable HTTP): are tool-uri, nu rute REST (`listOpenIncidents`, `getIncident`, `getTarget`,
       `getRecentMetrics`, `getRecentLogs`, `findSimilarIncidents`, `getAllowedActions`, `proposeRemediation`); folosesc aceleași service-uri și aceleași permisiuni ca REST.
     - `/actuator/health` și `/actuator/prometheus` (management pe portul 8081, nepublicat), simulatorul (`/sim/**`, port 8090) și topicurile Kafka (`netpilot-docs/kafka-topics.md`).
+    - Notificările pe Slack (F13b): ieșire spre Incoming Webhook-ul din `SLACK_WEBHOOK_URL`, consumator Kafka, nu rută REST.
 servers:
   - url: https://{domain}
     description: EC2, prin nginx cu TLS (și Kong din F17)
@@ -54,7 +57,7 @@ tags:
   - name: targets
     description: Ținte monitorizate, metricile și logurile lor
   - name: devices
-    description: Dispozitive IoT simulate și cheia lor
+    description: Dispozitive IoT (Raspberry Pi și simulate) și cheia lor
   - name: ingest
     description: Telemetria trimisă de dispozitive, cu cheie API
   - name: incidents
@@ -62,7 +65,9 @@ tags:
   - name: alert-rules
     description: Reguli de prag și de lipsă de date
   - name: remediations
-    description: Acțiuni propuse, validate, aprobate de un om și verificate
+    description: Acțiuni propuse, validate, aprobate de un om (sau, pe whitelist-ul auto, de sistem) și verificate
+  - name: autonomy
+    description: Kill-switch-ul modului autonom și whitelist-ul acțiunilor auto (din F13b)
 
 paths:
   /api/v1/auth/login:
@@ -656,6 +661,8 @@ paths:
         `target_id` se scrie mereu ca ținta incidentului; `targetId` din cerere se păstrează doar ca `requestedTargetId`
         și, dacă diferă (chiar inexistent), propunerea iese `TARGET_MISMATCH`.
         Un singur `PROPOSED` deschis per incident: a doua propunere dă 409. Contul AGENT propune prin tool-ul MCP `proposeRemediation` (F9), același service.
+        Din F13b, o propunere validă a agentului pentru o acțiune `auto`, cu modul autonom pornit, iese `AUTO_APPROVED` (în buget) sau `ESCALATED` (peste buget);
+        propunerile omului (`source: HUMAN`) rămân `PROPOSED`.
       operationId: proposeRemediation
       requestBody:
         required: true
@@ -727,7 +734,9 @@ paths:
         Din F7: **200** cu `EXECUTING`; rezultatul (`SUCCEEDED` / `FAILED`) se vede la ciclul următor, prin `GET /remediations/{id}`.
         Din F13: pentru `RESTART_CONTAINER` răspunsul e **202** (cererea pleacă pe Kafka, restartul nu mai ține cererea HTTP deschisă);
         comenzile de dispozitiv și `NO_ACTION` păstrează 200.
-        Contul AGENT primește 403: n-are `REMEDIATION_APPROVE`. Pe o acțiune care nu e `PROPOSED` (și pe una expirată): 409.
+        Contul AGENT primește 403: n-are `REMEDIATION_APPROVE`. Pe o acțiune care nu e `PROPOSED` sau, din F13b, `ESCALATED` (și pe una expirată): 409.
+        Aprobarea automată (F13b) nu trece prin această rută: o face sistemul, pe aceeași cale de execuție.
+        Pe un `ESCALATED` validatorul rulează înainte de orice: dacă refuză (de ex. `COOLDOWN_ACTIVE`), 409 cu motivul, acțiunea rămâne `ESCALATED` și nu se execută nimic.
       operationId: approveRemediation
       responses:
         '200':
@@ -752,8 +761,8 @@ paths:
       tags: [remediations]
       summary: Respinge propunerea (REMEDIATION_APPROVE)
       description: |
-        Planificat — din F7. `PROPOSED` → `REJECTED`, eveniment `REJECTED` cu emailul din token.
-        Pe o acțiune care nu e `PROPOSED`: 409.
+        Planificat — din F7. `PROPOSED` (din F13b și `ESCALATED`) → `REJECTED`, eveniment `REJECTED` cu emailul din token.
+        Pe o acțiune care nu e `PROPOSED` sau `ESCALATED`: 409.
       operationId: rejectRemediation
       responses:
         '200':
@@ -766,6 +775,90 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /api/v1/settings/autonomy:
+    get:
+      tags: [autonomy]
+      summary: Starea kill-switch-ului modului autonom (INCIDENT_VIEW)
+      description: |
+        Planificat — din F13b. Implicit `autonomousMode: false`. UI-ul o arată pe fiecare pagină (U3b).
+      operationId: getAutonomySettings
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutonomySettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [autonomy]
+      summary: Pornește sau oprește modul autonom; doar administratorul (AUTONOMY_MANAGE)
+      description: |
+        Planificat — din F13b. Kill-switch-ul global: cu `false`, nicio propunere nu mai e aprobată de sistem; acțiunile deja aprobate
+        nu se opresc. Efectul e pe loc (fără cache). OPERATOR și AGENT primesc 403. Comutarea se loghează cu emailul din token.
+      operationId: updateAutonomySettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutonomySettingsUpdate' }
+      responses:
+        '200':
+          description: Salvat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutonomySettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/action-policies:
+    get:
+      tags: [autonomy]
+      summary: Whitelist-ul autonomiei, câte un rând per acțiune (INCIDENT_VIEW)
+      description: |
+        Planificat — din F13b. Mereu 4 elemente, câte unul per `ActionType`, nepaginat. La pornire toate au `auto: false`.
+      operationId: listActionPolicies
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ActionPolicy' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/action-policies/{actionType}:
+    parameters:
+      - name: actionType
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ActionType' }
+    patch:
+      tags: [autonomy]
+      summary: Marchează o acțiune auto și îi fixează bugetul; doar administratorul (AUTONOMY_MANAGE)
+      description: |
+        Planificat — din F13b. Câmpurile lipsă rămân neschimbate. `NO_ACTION` cu `auto: true` dă 400 (un diagnostic îl acceptă un om).
+        Bugetul e per țintă și acțiune: cel mult `maxAutoAttempts` aprobări de sistem în ultimele `autoWindowMinutes`; peste el, propunerea iese `ESCALATED`.
+      operationId: updateActionPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionPolicyPatch' }
+      responses:
+        '200':
+          description: Salvat
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionPolicy' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -774,7 +867,7 @@ components:
       bearerFormat: JWT
       description: |
         Tokenul din `POST /auth/login` (HS256, 60 de minute) până la F16; din F16, tokenul Keycloak (realm `netpilot`).
-        Permisiunile sunt cele 13 din enum-ul `Permission`, în claim-ul rolului.
+        Permisiunile sunt cele 14 din enum-ul `Permission`, în claim-ul rolului.
     deviceKey:
       type: apiKey
       in: header
@@ -877,15 +970,16 @@ components:
     Role:
       type: string
       description: |
-        Permisiunile rezultă din rol, dintr-o singură hartă în cod (`RolePermissions`): VIEWER 4, OPERATOR 9, ADMIN 13, AGENT 5.
+        Permisiunile rezultă din rol, dintr-o singură hartă în cod (`RolePermissions`): VIEWER 4, OPERATOR 9, ADMIN 14, AGENT 5.
       enum: [VIEWER, OPERATOR, ADMIN, AGENT]
 
     Permission:
       type: string
       description: |
-        Toate cele 13, definite din F2. VIEWER: TARGET_VIEW, METRIC_VIEW, INCIDENT_VIEW, ASSISTANT_USE.
+        Toate cele 14, definite din F2. VIEWER: TARGET_VIEW, METRIC_VIEW, INCIDENT_VIEW, ASSISTANT_USE.
         OPERATOR: VIEWER + LOG_VIEW, INCIDENT_MANAGE, REMEDIATION_PROPOSE, REMEDIATION_APPROVE, AUDIT_VIEW. ADMIN: toate.
-        AGENT: TARGET_VIEW, METRIC_VIEW, LOG_VIEW, INCIDENT_VIEW, REMEDIATION_PROPOSE (nu are REMEDIATION_APPROVE și nici ASSISTANT_USE).
+        AGENT: TARGET_VIEW, METRIC_VIEW, LOG_VIEW, INCIDENT_VIEW, REMEDIATION_PROPOSE (nu are REMEDIATION_APPROVE, AUTONOMY_MANAGE și nici ASSISTANT_USE).
+        AUTONOMY_MANAGE (doar ADMIN) se folosește din F13b: aprobarea automată e a sistemului, nu a agentului.
       enum:
         - TARGET_VIEW
         - TARGET_MANAGE
@@ -900,6 +994,7 @@ components:
         - AUDIT_VIEW
         - ASSISTANT_USE
         - USER_MANAGE
+        - AUTONOMY_MANAGE
 
     TargetType:
       type: string
@@ -925,10 +1020,14 @@ components:
         - temperature_c
         - battery_percent
         - rssi_dbm
+        - load_1m
+        - mem_free_mb
+        - uptime_seconds
 
     DeviceMetricKey:
       type: string
-      enum: [temperature_c, battery_percent, rssi_dbm]
+      description: Senzorii simulați trimit primele trei; Raspberry Pi-ul `temperature_c`, `load_1m`, `mem_free_mb`, `uptime_seconds` (F5).
+      enum: [temperature_c, battery_percent, rssi_dbm, load_1m, mem_free_mb, uptime_seconds]
 
     LogLevel:
       type: string
@@ -949,7 +1048,8 @@ components:
 
     IncidentEventType:
       type: string
-      enum: [OPENED, ACKNOWLEDGED, AGENT_STARTED, PROPOSED, APPROVED, REJECTED, EXECUTED, FAILED, RESOLVED, NOTE]
+      description: '`ESCALATED` din F13b. O aprobare de sistem e `APPROVED` cu actorul `system`.'
+      enum: [OPENED, ACKNOWLEDGED, AGENT_STARTED, PROPOSED, APPROVED, REJECTED, EXECUTED, FAILED, RESOLVED, NOTE, ESCALATED]
 
     RuleOperator:
       type: string
@@ -969,7 +1069,9 @@ components:
       description: |
         `PROPOSED` → `APPROVED` → `EXECUTING` → `SUCCEEDED` / `FAILED`; `REJECTED_BY_VALIDATION` la propunere invalidă,
         `REJECTED` când un om respinge, `EXPIRED` după 15 minute (sau după `validUntil`, din F14).
-      enum: [PROPOSED, REJECTED_BY_VALIDATION, APPROVED, REJECTED, EXPIRED, EXECUTING, SUCCEEDED, FAILED]
+        Din F13b: `AUTO_APPROVED` (aprobată de sistem, pe whitelist-ul auto) → `EXECUTING` pe aceeași cale; `ESCALATED` când bugetul e consumat
+        sau verificarea unei acțiuni aprobate de sistem pică; o `ESCALATED` așteaptă un om, ca o `PROPOSED`.
+      enum: [PROPOSED, REJECTED_BY_VALIDATION, APPROVED, REJECTED, EXPIRED, EXECUTING, SUCCEEDED, FAILED, AUTO_APPROVED, ESCALATED]
 
     RejectionReason:
       type: string
@@ -1079,7 +1181,7 @@ components:
       required: [id, deviceType, samplingSeconds]
       properties:
         id: { type: integer, format: int64, example: 3 }
-        deviceType: { type: string, example: temperature-sensor }
+        deviceType: { type: string, description: 'Text liber, de ex. `temperature-sensor`, `raspberry-pi`.', example: temperature-sensor }
         firmware: { type: [string, 'null'], example: 1.0.2 }
         samplingSeconds: { type: integer, minimum: 5, maximum: 300, example: 10 }
 
@@ -1161,7 +1263,7 @@ components:
       properties:
         samples:
           type: array
-          description: Poate lipsi sau fi goală (200, doar `last_seen_at`). O cheie în afara celor trei dă 400.
+          description: Poate lipsi sau fi goală (200, doar `last_seen_at`). O cheie în afara celor șase de dispozitiv dă 400.
           items: { $ref: '#/components/schemas/TelemetrySample' }
         ack:
           type: array
@@ -1336,21 +1438,44 @@ components:
             - $ref: '#/components/schemas/RejectionReason'
             - type: 'null'
         status: { $ref: '#/components/schemas/RemediationStatus' }
-        decidedBy: { type: [string, 'null'], example: operator@netpilot.ro }
+        decidedBy: { type: [string, 'null'], description: 'Emailul omului sau `system` (din F13b).', example: operator@netpilot.ro }
         decidedAt: { type: [string, 'null'], example: '2026-10-30T10:08:00' }
         executedAt: { type: [string, 'null'], example: '2026-10-30T10:08:05' }
         resultMessage: { type: [string, 'null'], maxLength: 500 }
         expiresAt: { type: string, description: 'Propunerea + 15 minute.', example: '2026-10-30T10:22:00' }
         createdAt: { type: string, example: '2026-10-30T10:07:00' }
+        autoApprovedAt: { type: [string, 'null'], description: 'Momentul aprobării de sistem; rămâne și după o reaprobare umană. Din F13b.', example: null }
 
 
-    AnswerSource:
+    AutonomySettings:
       type: object
-      required: [tool]
+      required: [autonomousMode]
       properties:
-        tool: { type: string, example: listOpenIncidents }
-        arguments:
-          type: object
-          additionalProperties: true
-          example: {}
+        autonomousMode: { type: boolean, example: false }
+        updatedBy: { type: [string, 'null'], example: admin@netpilot.ro }
+        updatedAt: { type: [string, 'null'], example: '2026-11-05T10:00:00' }
 
+    AutonomySettingsUpdate:
+      type: object
+      required: [autonomousMode]
+      properties:
+        autonomousMode: { type: boolean, example: true }
+
+    ActionPolicy:
+      type: object
+      required: [actionType, auto, maxAutoAttempts, autoWindowMinutes]
+      properties:
+        actionType: { $ref: '#/components/schemas/ActionType' }
+        auto: { type: boolean, example: true }
+        maxAutoAttempts: { type: integer, minimum: 1, maximum: 5, example: 2 }
+        autoWindowMinutes: { type: integer, minimum: 10, maximum: 1440, example: 60 }
+        updatedBy: { type: [string, 'null'], example: admin@netpilot.ro }
+        updatedAt: { type: [string, 'null'], example: '2026-11-05T10:00:00' }
+
+    ActionPolicyPatch:
+      type: object
+      minProperties: 1
+      properties:
+        auto: { type: boolean, example: true }
+        maxAutoAttempts: { type: integer, minimum: 1, maximum: 5, example: 2 }
+        autoWindowMinutes: { type: integer, minimum: 10, maximum: 1440, example: 60 }

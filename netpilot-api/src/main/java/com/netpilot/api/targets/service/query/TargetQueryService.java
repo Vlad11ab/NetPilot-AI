@@ -6,4 +6,5 @@ import org.springframework.data.domain.Pageable;
 
 public interface TargetQueryService {
     Page<TargetResponse> listTargets(Pageable pageable);
+    TargetResponse getTarget(Long targetId);
 }

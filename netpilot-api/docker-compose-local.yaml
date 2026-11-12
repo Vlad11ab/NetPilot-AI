@@ -15,5 +15,19 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  netpilot-api:
+    image: vlad11ab/net-pilot-ai-api:0.1
+    environment:
+      DB_URL: "jdbc:mysql://mysql:3306/net_pilot_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&createDatabaseIfNotExist=true"
+      DB_USER: root
+      DB_PASSWORD: root
+      SERVER_SERVLET_CONTEXT_PATH: /netpilot
+    ports:
+      - "127.0.0.1:9000:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   mysql_data:

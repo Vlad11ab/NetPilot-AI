@@ -1,9 +1,12 @@
 package targets.services;
 
+import com.netpilot.api.targets.constants.TargetConstants;
 import com.netpilot.api.targets.dtos.TargetResponse;
+import com.netpilot.api.targets.exceptions.TargetNotFoundException;
 import com.netpilot.api.targets.model.TargetType;
 import com.netpilot.api.targets.model.Targets;
 import com.netpilot.api.targets.repository.TargetRepository;
+import com.netpilot.api.targets.service.query.TargetQueryService;
 import com.netpilot.api.targets.service.query.impl.TargetQueryServiceImpl;
 
 import org.junit.jupiter.api.Test;
@@ -15,11 +18,17 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.testcontainers.shaded.com.fasterxml.jackson.databind.introspect.TypeResolutionContext;
+import org.testcontainers.shaded.org.bouncycastle.asn1.cmp.Challenge;
 
 
 import java.util.List;
+import java.util.Optional;
+import java.util.Random;
+import java.util.UUID;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -61,6 +70,27 @@ public class TargetQueryServiceImplTest {
         assertThat(response.type()).isEqualTo(TargetType.DEVICE);
 
         verify(targetRepository).findAll(pageable);
-
     }
+
+    @Test
+    void getTarget_ThrowsWhenNotFound(){
+        Random random = new Random();
+        Long missingId = 9L;
+
+        when(targetRepository.findById(missingId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(()-> targetQueryService.getTarget(missingId))
+                .isInstanceOf(TargetNotFoundException.class)
+                .hasMessage(TargetConstants.TARGET_NOT_FOUND);
+    }
+
+    @Test
+    void getTarget_ReturnsTarget(){
+        when(targetRepository.findById(target1.getId())).thenReturn(Optional.of(target1));
+
+        TargetResponse response = new TargetResponse(1L,"Slug1","Name1",TargetType.DEVICE);
+
+        assertThat(targetQueryService.getTarget(target1.getId())).isEqualTo(response);
+    }
+
 }

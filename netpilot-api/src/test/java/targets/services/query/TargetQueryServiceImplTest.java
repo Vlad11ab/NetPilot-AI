@@ -1,4 +1,4 @@
-package targets.services;
+package targets.services.query;
 
 import com.netpilot.api.targets.constants.TargetConstants;
 import com.netpilot.api.targets.dtos.TargetResponse;
@@ -6,7 +6,6 @@ import com.netpilot.api.targets.exceptions.TargetNotFoundException;
 import com.netpilot.api.targets.model.TargetType;
 import com.netpilot.api.targets.model.Targets;
 import com.netpilot.api.targets.repository.TargetRepository;
-import com.netpilot.api.targets.service.query.TargetQueryService;
 import com.netpilot.api.targets.service.query.impl.TargetQueryServiceImpl;
 
 import org.junit.jupiter.api.Test;
@@ -18,14 +17,11 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
-import org.testcontainers.shaded.com.fasterxml.jackson.databind.introspect.TypeResolutionContext;
-import org.testcontainers.shaded.org.bouncycastle.asn1.cmp.Challenge;
 
 
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
-import java.util.UUID;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;

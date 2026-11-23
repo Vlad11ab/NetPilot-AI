@@ -30,7 +30,7 @@ services:
   nginx:
     image: nginx:1.28-alpine
     ports:
-      - "9000:80"
+      - "80:80"
     volumes:
       - ./nginx:/etc/nginx/conf.d:ro
     depends_on:
@@ -39,3 +39,6 @@ services:
 
 volumes:
   mysql_data:
+
+
+##termina partea de nginx pe EC si termina F1
